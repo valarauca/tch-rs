@@ -12,6 +12,12 @@
 #include <torch/script.h>
 #include <torch/torch.h>
 #include <vector>
+#ifdef TCH_CUDA
+namespace c10 { namespace cuda { ::c10::DeviceIndex device_count(); } }
+#endif
+#ifdef TCH_XPU
+namespace c10 { namespace xpu { ::c10::DeviceIndex device_count(); } }
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -50,13 +56,17 @@ c10::List<c10::optional<torch::Tensor>> of_carray_tensor_opt(torch::Tensor **vs,
 }
 
 at::Device device_of_int(int d) {
-  if (d == -3)
-    return at::Device(at::kVulkan);
+  if (d >= 0)
+    return at::Device(at::kCUDA, /*index=*/d);
+  if (d == -1)
+    return at::Device(at::kCPU);
   if (d == -2)
     return at::Device(at::kMPS);
-  if (d < 0)
-    return at::Device(at::kCPU);
-  return at::Device(at::kCUDA, /*index=*/d);
+  if (d <= -200)
+    return at::Device(at::kXPU, /*index=*/-200 - d);
+  if (d <= -100)
+    return at::Device(at::kVulkan, /*index=*/-100 - d);
+  return at::Device(at::kCPU);
 }
 tensor at_new_tensor() {
   PROTECT(return new torch::Tensor();)
@@ -195,7 +205,8 @@ bool at_autocast_set_enabled(bool b) {
 int at_device(tensor t) {
   PROTECT(auto device = t->device(); if (device.type() == at::kCPU) return -1;
           if (device.type() == at::kMPS) return -2;
-          if (device.type() == at::kVulkan) return -3;
+          if (device.type() == at::kVulkan) return -100 - device.index();
+          if (device.type() == at::kXPU) return -200 - device.index();
           if (device.type() == at::kCUDA) return device.index();)
   return -2;
 }
@@ -834,12 +845,20 @@ char *ats_to_string(scalar s) {
 void ats_free(scalar s) { delete (s); }
 
 int atc_cuda_device_count() {
+#ifdef TCH_CUDA
+  PROTECT(return c10::cuda::device_count();)
+#else
   PROTECT(return torch::cuda::device_count();)
+#endif
   return -1;
 }
 
 int atc_cuda_is_available() {
+#ifdef TCH_CUDA
+  PROTECT(return c10::cuda::device_count() > 0;)
+#else
   PROTECT(return torch::cuda::is_available();)
+#endif
   return -1;
 }
 
@@ -871,6 +890,29 @@ void atc_set_user_enabled_cudnn(int b) {
 
 void atc_set_benchmark_cudnn(int b) {
   PROTECT(at::globalContext().setBenchmarkCuDNN(b);)
+}
+
+int atc_xpu_device_count() {
+#ifdef TCH_XPU
+  PROTECT(return c10::xpu::device_count();)
+#else
+  PROTECT(return at::detail::getXPUHooks().deviceCount();)
+#endif
+  return -1;
+}
+
+int atc_xpu_is_available() {
+#ifdef TCH_XPU
+  PROTECT(return c10::xpu::device_count() > 0;)
+#else
+  PROTECT(return at::hasXPU();)
+#endif
+  return -1;
+}
+
+int atc_vulkan_is_available() {
+  PROTECT(return at::is_vulkan_available();)
+  return -1;
 }
 
 bool at_context_has_openmp() {

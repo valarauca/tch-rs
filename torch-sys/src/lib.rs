@@ -1,5 +1,6 @@
 pub mod cuda;
 pub mod io;
+pub mod xpu;
 #[cfg(feature = "python-extension")]
 pub mod python;
 mod traits;

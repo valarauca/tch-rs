@@ -50,6 +50,32 @@ enum Os {
     Windows,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Cuda,
+    OneApi,
+}
+
+impl Backend {
+    fn torch_backend(self) -> &'static str {
+        match self {
+            Backend::Cuda => "cu130",
+            Backend::OneApi => "xpu",
+        }
+    }
+}
+
+fn selected_backends() -> Vec<Backend> {
+    let mut backends = vec![];
+    if env::var("CARGO_FEATURE_CUDA").is_ok() {
+        backends.push(Backend::Cuda);
+    }
+    if env::var("CARGO_FEATURE_ONEAPI").is_ok() {
+        backends.push(Backend::OneApi);
+    }
+    backends
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct SystemInfo {
@@ -153,6 +179,71 @@ fn env_var_rerun(name: &str) -> Result<String, env::VarError> {
     env::var(name)
 }
 
+fn find_in_path(exe: &str) -> Option<PathBuf> {
+    let paths = env::var_os("PATH")?;
+    env::split_paths(&paths).map(|dir| dir.join(exe)).find(|p| p.is_file())
+}
+
+fn resolve_uv() -> Result<PathBuf> {
+    if let Ok(path) = env_var_rerun("TCH_RS_UV_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    find_in_path("uv").context("`uv` not found in PATH; set TCH_RS_UV_PATH or install uv")
+}
+
+fn resolve_python(os: Os) -> PathBuf {
+    if let Ok(path) = env_var_rerun("TCH_RS_PYTHON_PATH") {
+        return PathBuf::from(path);
+    }
+    let exe = match os {
+        Os::Windows => "python.exe",
+        Os::Linux | Os::Macos if env::var_os("VIRTUAL_ENV").is_some() => "python",
+        _ => "python3",
+    };
+    find_in_path(exe).unwrap_or_else(|| PathBuf::from(exe))
+}
+
+fn venv_python(venv: &Path, os: Os) -> PathBuf {
+    match os {
+        Os::Windows => venv.join("Scripts/python.exe"),
+        _ => venv.join("bin/python"),
+    }
+}
+
+fn run_uv(uv: &Path, args: &[String]) -> Result<()> {
+    let status = std::process::Command::new(uv)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run {uv:?}"))?;
+    if !status.success() {
+        anyhow::bail!("`uv {}` failed with {status}", args.join(" "));
+    }
+    Ok(())
+}
+
+fn uv_install(os: Os) -> Result<Option<PathBuf>> {
+    let backends = selected_backends();
+    if backends.len() > 1 {
+        anyhow::bail!("incompatible backends: enable only one of cuda/oneapi");
+    }
+    let backend = match backends.first() {
+        None => return Ok(None),
+        Some(backend) => *backend,
+    };
+    let uv = resolve_uv()?;
+    let out_dir = PathBuf::from(env::var("OUT_DIR").context("OUT_DIR variable not set")?);
+    let venv = out_dir.join("venv");
+    run_uv(&uv, &["venv".into(), venv.to_string_lossy().into_owned()])?;
+    let python = venv_python(&venv, os);
+    let install = ["pip", "install", "--torch-backend", backend.torch_backend(), "--python"]
+        .into_iter()
+        .map(String::from)
+        .chain([python.to_string_lossy().into_owned(), format!("torch=={TORCH_VERSION}")])
+        .collect::<Vec<_>>();
+    run_uv(&uv, &install)?;
+    Ok(Some(python))
+}
+
 fn version_check(version: &str) -> Result<()> {
     if env_var_rerun("LIBTORCH_BYPASS_VERSION_CHECK").is_ok() {
         return Ok(());
@@ -179,15 +270,15 @@ impl SystemInfo {
         };
         // Locate the currently active Python binary, similar to:
         // https://github.com/PyO3/maturin/blob/243b8ec91d07113f97a6fe74d9b2dcb88086e0eb/src/target.rs#L547
-        let python_interpreter = match os {
-            Os::Windows => PathBuf::from("python.exe"),
-            Os::Linux | Os::Macos => {
-                if env::var_os("VIRTUAL_ENV").is_some() {
-                    PathBuf::from("python")
-                } else {
-                    PathBuf::from("python3")
-                }
-            }
+        let use_pytorch = env_var_rerun("LIBTORCH_USE_PYTORCH").is_ok();
+        let uv_python = if !use_pytorch && env::var_os("LIBTORCH").is_none() {
+            uv_install(os)?
+        } else {
+            None
+        };
+        let python_interpreter = match &uv_python {
+            Some(python) => python.clone(),
+            None => resolve_python(os),
         };
         let mut libtorch_include_dirs = vec![];
         if cfg!(feature = "python-extension") {
@@ -203,7 +294,7 @@ impl SystemInfo {
             }
         }
         let mut libtorch_lib_dir = None;
-        let cxx11_abi = if env_var_rerun("LIBTORCH_USE_PYTORCH").is_ok() {
+        let cxx11_abi = if use_pytorch || uv_python.is_some() {
             let output = std::process::Command::new(&python_interpreter)
                 .arg("-c")
                 .arg(PYTHON_PRINT_PYTORCH_DETAILS)
@@ -376,7 +467,8 @@ impl SystemInfo {
                 // as DEP_TORCH_SYS_LIBTORCH_LIB, see:
                 // https://doc.rust-lang.org/cargo/reference/build-scripts.html#the-links-manifest-key
                 println!("cargo:libtorch_lib={}", self.libtorch_lib_dir.display());
-                cc::Build::new()
+                let mut build = cc::Build::new();
+                build
                     .cpp(true)
                     .pic(true)
                     .warnings(false)
@@ -385,8 +477,14 @@ impl SystemInfo {
                     .flag("-std=c++17")
                     .flag(format!("-D_GLIBCXX_USE_CXX11_ABI={}", self.cxx11_abi))
                     .flag("-DGLOG_USE_GLOG_EXPORT")
-                    .files(&c_files)
-                    .compile("tch");
+                    .files(&c_files);
+                if cfg!(feature = "cuda") {
+                    build.define("TCH_CUDA", None);
+                }
+                if cfg!(feature = "oneapi") {
+                    build.define("TCH_XPU", None);
+                }
+                build.compile("tch");
             }
             Os::Windows => {
                 // TODO: Pass "/link" "LIBPATH:{}" to cl.exe in order to emulate rpath.
@@ -451,13 +549,16 @@ fn main() -> anyhow::Result<()> {
             || si_lib.join("torch_cuda_cpp.dll").exists();
         let use_hip =
             si_lib.join("libtorch_hip.so").exists() || si_lib.join("torch_hip.dll").exists();
+        let use_xpu =
+            si_lib.join("libtorch_xpu.so").exists() || si_lib.join("torch_xpu.dll").exists();
         println!("cargo:rustc-link-search=native={}", si_lib.display());
 
         system_info.make();
 
         println!("cargo:rustc-link-lib=static=tch");
         if use_cuda {
-            system_info.link("torch_cuda")
+            system_info.link("torch_cuda");
+            system_info.link("c10_cuda")
         }
         if use_cuda_cu {
             system_info.link("torch_cuda_cu")
@@ -467,6 +568,10 @@ fn main() -> anyhow::Result<()> {
         }
         if use_hip {
             system_info.link("torch_hip")
+        }
+        if use_xpu {
+            system_info.link("torch_xpu");
+            system_info.link("c10_xpu")
         }
         if cfg!(feature = "python-extension") {
             system_info.link("torch_python")

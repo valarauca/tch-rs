@@ -1,16 +1,23 @@
 //! Devices on which tensor computations are run.
 
+/// Base used to encode an indexed Vulkan device into the `c_int` FFI value.
+const VULKAN_BASE: libc::c_int = -100;
+/// Base used to encode an indexed Intel XPU (oneAPI) device into the `c_int` FFI value.
+const XPU_BASE: libc::c_int = -200;
+
 /// A torch device.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Device {
     /// The main CPU device.
     Cpu,
-    /// The main GPU device.
+    /// An NVIDIA Cuda device.
     Cuda(usize),
     /// The main MPS device.
     Mps,
-    /// The main Vulkan device.
-    Vulkan,
+    /// A Vulkan device.
+    Vulkan(usize),
+    /// An Intel XPU (oneAPI) device.
+    Xpu(usize),
 }
 
 /// Cuda related helper functions.
@@ -82,13 +89,37 @@ impl Cuda {
     }
 }
 
+/// Intel XPU (oneAPI) related helper functions.
+pub enum Xpu {}
+impl Xpu {
+    /// Returns the number of XPU devices available.
+    pub fn device_count() -> i64 {
+        i64::from(unsafe_torch!(torch_sys::xpu::atc_xpu_device_count()))
+    }
+
+    /// Returns true if at least one XPU device is available.
+    pub fn is_available() -> bool {
+        unsafe_torch!(torch_sys::xpu::atc_xpu_is_available()) != 0
+    }
+}
+
+/// Vulkan related helper functions.
+pub enum Vulkan {}
+impl Vulkan {
+    /// Returns true if a Vulkan device is available.
+    pub fn is_available() -> bool {
+        unsafe_torch!(torch_sys::xpu::atc_vulkan_is_available()) != 0
+    }
+}
+
 impl Device {
     pub(super) fn c_int(self) -> libc::c_int {
         match self {
             Device::Cpu => -1,
-            Device::Cuda(device_index) => device_index as libc::c_int,
+            Device::Cuda(index) => index as libc::c_int,
             Device::Mps => -2,
-            Device::Vulkan => -3,
+            Device::Vulkan(index) => VULKAN_BASE - index as libc::c_int,
+            Device::Xpu(index) => XPU_BASE - index as libc::c_int,
         }
     }
 
@@ -96,8 +127,9 @@ impl Device {
         match v {
             -1 => Device::Cpu,
             -2 => Device::Mps,
-            -3 => Device::Vulkan,
             index if index >= 0 => Device::Cuda(index as usize),
+            index if index <= XPU_BASE => Device::Xpu((XPU_BASE - index) as usize),
+            index if index <= VULKAN_BASE => Device::Vulkan((VULKAN_BASE - index) as usize),
             _ => panic!("unexpected device {v}"),
         }
     }
@@ -112,9 +144,6 @@ impl Device {
     }
 
     pub fn is_cuda(self) -> bool {
-        match self {
-            Device::Cuda(_) => true,
-            Device::Cpu | Device::Mps | Device::Vulkan => false,
-        }
+        matches!(self, Device::Cuda(_))
     }
 }
