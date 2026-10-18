@@ -271,11 +271,8 @@ impl SystemInfo {
         // Locate the currently active Python binary, similar to:
         // https://github.com/PyO3/maturin/blob/243b8ec91d07113f97a6fe74d9b2dcb88086e0eb/src/target.rs#L547
         let use_pytorch = env_var_rerun("LIBTORCH_USE_PYTORCH").is_ok();
-        let uv_python = if !use_pytorch && env::var_os("LIBTORCH").is_none() {
-            uv_install(os)?
-        } else {
-            None
-        };
+        let uv_python =
+            if !use_pytorch && env::var_os("LIBTORCH").is_none() { uv_install(os)? } else { None };
         let python_interpreter = match &uv_python {
             Some(python) => python.clone(),
             None => resolve_python(os),

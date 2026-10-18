@@ -19,6 +19,25 @@ namespace c10 { namespace cuda { ::c10::DeviceIndex device_count(); } }
 namespace c10 { namespace xpu { ::c10::DeviceIndex device_count(); } }
 #endif
 
+#if defined(TCH_CUDA) || defined(TCH_XPU)
+#include <dlfcn.h>
+// Eagerly load the accelerator operator library at startup so its kernels are
+// registered with the dispatcher. The C API references no symbol from it
+// directly, so the linker would otherwise drop it (`--as-needed`).
+namespace {
+struct TchLoadAccelerators {
+  TchLoadAccelerators() {
+#ifdef TCH_CUDA
+    dlopen("libtorch_cuda.so", RTLD_NOW | RTLD_GLOBAL);
+#endif
+#ifdef TCH_XPU
+    dlopen("libtorch_xpu.so", RTLD_NOW | RTLD_GLOBAL);
+#endif
+  }
+} tch_load_accelerators;
+}
+#endif
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
