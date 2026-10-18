@@ -231,11 +231,17 @@ fn uv_install(os: Os) -> Result<Option<PathBuf>> {
         Some(backend) => *backend,
     };
     let uv = resolve_uv()?;
-    let out_dir = PathBuf::from(env::var("OUT_DIR").context("OUT_DIR variable not set")?);
-    let venv = out_dir.join("venv");
-    run_uv(&uv, &["venv".into(), venv.to_string_lossy().into_owned()])?;
+    let venv = match env_var_rerun("TCH_RS_VENV") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => {
+            PathBuf::from(env::var("OUT_DIR").context("OUT_DIR variable not set")?).join("venv")
+        }
+    };
+    run_uv(&uv, &["venv".into(), "--allow-existing".into(), venv.to_string_lossy().into_owned()])?;
     let python = venv_python(&venv, os);
-    let install = ["pip", "install", "--torch-backend", backend.torch_backend(), "--python"]
+    println!("cargo:rerun-if-changed={}", python.display());
+    let index = format!("https://download.pytorch.org/whl/{}", backend.torch_backend());
+    let install = ["pip", "install", "--extra-index-url", &index, "--python"]
         .into_iter()
         .map(String::from)
         .chain([python.to_string_lossy().into_owned(), format!("torch=={TORCH_VERSION}")])
@@ -272,7 +278,7 @@ impl SystemInfo {
         // https://github.com/PyO3/maturin/blob/243b8ec91d07113f97a6fe74d9b2dcb88086e0eb/src/target.rs#L547
         let use_pytorch = env_var_rerun("LIBTORCH_USE_PYTORCH").is_ok();
         let uv_python =
-            if !use_pytorch && env::var_os("LIBTORCH").is_none() { uv_install(os)? } else { None };
+            if !use_pytorch && env_var_rerun("LIBTORCH").is_err() { uv_install(os)? } else { None };
         let python_interpreter = match &uv_python {
             Some(python) => python.clone(),
             None => resolve_python(os),
